@@ -1,26 +1,25 @@
 #!/usr/bin/env python3
 """
-Surface Classification via Range Profile — xWRL1432
+Grass Classifier via Range Profile — xWRL1432
 
-Captures range profiles and computes features that distinguish surface types:
-  - Mean reflected power (hard surfaces reflect more)
-  - Peak-to-mean ratio (smooth surfaces have sharper peaks)
-  - Bin-to-bin variance (rough surfaces scatter more diffusely)
-  - Decay rate (how quickly signal falls off with range)
+Record a grass reference profile, then continuously classify
+whether the live profile matches grass or not.
+
+Compares the live range profile against the recorded reference
+within a region of interest using L1 difference (sum of absolute
+per-bin differences in dB). Optionally slides the reference window
+by ±MAX_SHIFT_BINS to tolerate small sensor height changes.
 
 Usage:
-  1. Run the script, point radar at a surface
-  2. Type 'c' + Enter in terminal to capture a snapshot
-  3. Enter a name (e.g. 'grass', 'concrete', 'gravel')
-  4. Move to another surface, repeat
-  5. Compare the profiles and features across panels
-  6. Type 'q' to quit
+  1. Point radar at grass, press 'c' to record the reference
+  2. Move to other surfaces — dashboard shows GRASS / NOT GRASS
+  3. Press 'r' to re-record the reference
+  4. Press 'q' to quit
 """
 
 import serial
 import time
 import struct
-import sys
 import threading
 import numpy as np
 import matplotlib.pyplot as plt
@@ -30,18 +29,17 @@ from collections import deque
 # ── Radar Config ──────────────────────────────────────────────────
 PORT_CLI       = 'COM12'
 BAUD_INITIAL   = 115200
-BAUD_DATA      = 1250000
 CFG_FILE       = 'surface_range.cfg'
 
 MAGIC_WORD         = b'\x02\x01\x04\x03\x06\x05\x08\x07'
 PACKET_HEADER_SIZE = 40
 TLV_HEADER_SIZE    = 8
-TLV_RANGE_PROFILE  = 302   # Extended msg format
-TLV_RANGE_PROFILE_STD = 2  # Standard msg format
+TLV_RANGE_PROFILE  = 302
+TLV_RANGE_PROFILE_STD = 2
 
-# ── Radar Parameters (derived from .cfg) ─────────────────────────
+# ── Radar Parameters (from .cfg) ─────────────────────────────────
 NUM_ADC_SAMPLES  = 256
-SAMPLE_RATE_MHZ  = 12.5        # 100 / DigOutputSampRate(8)
+SAMPLE_RATE_MHZ  = 12.5
 SLOPE_MHZ_PER_US = 160.0
 C                = 3e8
 
@@ -51,23 +49,24 @@ RANGE_PER_BIN    = (C * SAMPLE_RATE_MHZ * 1e6) / \
 MAX_RANGE        = RANGE_PER_BIN * NUM_RANGE_BINS
 RANGE_AXIS       = np.arange(NUM_RANGE_BINS) * RANGE_PER_BIN
 
-# Analysis zone: skip DC bin, focus on near field (ground reflection)
-NEAR_START_M = 1
-NEAR_END_M   = 3
+# Analysis zone
+NEAR_START_M   = 0.75
+NEAR_END_M     = 2
 NEAR_BIN_START = max(1, int(NEAR_START_M / RANGE_PER_BIN))
 NEAR_BIN_END   = min(NUM_RANGE_BINS, int(NEAR_END_M / RANGE_PER_BIN))
 
-# ── Shared State ─────────────────────────────────────────────────
-data_lock          = threading.Lock()
-latest_profile     = None
-exit_event         = threading.Event()
-capture_event      = threading.Event()
-captured_surfaces  = {}  # name -> {'profile': array, 'features': dict}
+# Classification
+GRASS_THRESHOLD = 150.0   # max total L1 difference (dB) to count as grass — tune this
+MAX_SHIFT_BINS  = 1       # 0 = no shift, 1 = try ±1, 2 = try ±2, etc.
+AVG_FRAMES      = 10      # number of frames for moving average
 
-SURFACE_COLORS = [
-    '#e74c3c', '#2ecc71', '#3498db', '#f39c12', '#9b59b6', '#1abc9c',
-    '#e67e22', '#e84393', '#00cec9', '#fd79a8',
-]
+# ── Shared State ─────────────────────────────────────────────────
+data_lock      = threading.Lock()
+latest_profile = None
+exit_event     = threading.Event()
+capture_event  = threading.Event()
+
+grass_ref_db   = None   # recorded grass profile (dB, full length)
 
 
 # ── Serial Helpers ───────────────────────────────────────────────
@@ -177,43 +176,27 @@ def read_data_stream(ser):
         time.sleep(0.001)
 
 
-# ── Feature Extraction ───────────────────────────────────────────
-def compute_features(profile_linear):
-    """
-    Compute surface classification features from near-field range bins.
-    Input is linear-scale power values.
-    """
-    near = profile_linear[NEAR_BIN_START:NEAR_BIN_END].copy()
+# ── Classification ───────────────────────────────────────────────
+def classify_grass(live_db, ref_db):
+    """Compare live ROI against grass reference using L1 difference with shift alignment.
+    Instead of trimming, slide the ref window so both slices stay the same length."""
+    n = NEAR_BIN_END - NEAR_BIN_START
 
-    if len(near) == 0 or np.max(near) == 0:
-        return {'mean_power': 0, 'peak_to_mean': 0, 'variance': 0, 'decay_rate': 0}
+    live_roi = live_db[NEAR_BIN_START:NEAR_BIN_END]           # always fixed
 
-    near_db = 10 * np.log10(near + 1)
+    best_diff = float('inf')
+    best_shift = 0
 
-    # 1. Mean reflected power in analysis zone (dB)
-    mean_power = float(np.mean(near_db))
+    for shift in range(-MAX_SHIFT_BINS, MAX_SHIFT_BINS + 1):
+        ref_roi = ref_db[NEAR_BIN_START + shift : NEAR_BIN_END + shift]  # slide ref window
 
-    # 2. Peak-to-mean ratio — high for specular (smooth) surfaces
-    peak_to_mean = float(np.max(near_db) / (mean_power + 1e-6))
+        diff = float(np.sum(np.abs(live_roi - ref_roi)))
 
-    # 3. Bin-to-bin variance — high for rough/scattering surfaces
-    diffs = np.diff(near_db)
-    variance = float(np.var(diffs))
+        if diff < best_diff:
+            best_diff = diff
+            best_shift = shift
 
-    # 4. Decay rate — linear fit slope of dB vs range bin
-    x = np.arange(len(near_db))
-    if len(x) > 1:
-        coeffs = np.polyfit(x, near_db, 1)
-        decay_rate = float(-coeffs[0])  # positive = decaying
-    else:
-        decay_rate = 0.0
-
-    return {
-        'mean_power':   round(mean_power, 2),
-        'peak_to_mean': round(peak_to_mean, 3),
-        'variance':     round(variance, 3),
-        'decay_rate':   round(decay_rate, 4),
-    }
+    return best_diff <= GRASS_THRESHOLD, best_diff, best_shift
 
 
 # ── User Input Thread ────────────────────────────────────────────
@@ -223,7 +206,7 @@ def input_thread():
             cmd = input().strip().lower()
         except EOFError:
             break
-        if cmd == 'c':
+        if cmd in ('c', 'r'):
             capture_event.set()
         elif cmd in ('q', 'quit', 'exit'):
             exit_event.set()
@@ -232,11 +215,11 @@ def input_thread():
 
 
 # ── Plot Styling ─────────────────────────────────────────────────
-BG_DARK   = '#0f0f1a'
-BG_PANEL  = '#161625'
-GRID_CLR  = '#2a2a4a'
-TEXT_CLR   = '#ccccdd'
-ACCENT    = '#00d2ff'
+BG_DARK  = '#0f0f1a'
+BG_PANEL = '#161625'
+GRID_CLR = '#2a2a4a'
+TEXT_CLR  = '#ccccdd'
+ACCENT   = '#00d2ff'
 
 def style_ax(ax, title):
     ax.set_facecolor(BG_PANEL)
@@ -249,15 +232,19 @@ def style_ax(ax, title):
 
 # ── Main ─────────────────────────────────────────────────────────
 def main():
+    global grass_ref_db
+
     print("=" * 62)
-    print("   xWRL1432 Surface Classifier — Range Profile Analysis")
+    print("   xWRL1432 Grass Classifier — Range Profile Matching")
     print("=" * 62)
     print(f"   Range/bin:      {RANGE_PER_BIN*100:.2f} cm")
-    print(f"   Max range:      {MAX_RANGE:.2f} m")
     print(f"   Analysis zone:  {NEAR_START_M} – {NEAR_END_M} m  "
           f"(bins {NEAR_BIN_START}–{NEAR_BIN_END})")
+    print(f"   Threshold:      {GRASS_THRESHOLD} (L1 diff, lower = more similar)")
+    print(f"   Max shift:      ±{MAX_SHIFT_BINS} bins ({MAX_SHIFT_BINS * RANGE_PER_BIN * 100:.1f} cm)")
     print()
-    print("   'c' + Enter  →  capture current surface")
+    print("   'c' + Enter  →  record grass reference (point at grass first!)")
+    print("   'r' + Enter  →  re-record reference")
     print("   'q' + Enter  →  quit")
     print("=" * 62)
 
@@ -269,7 +256,6 @@ def main():
     threading.Thread(target=read_data_stream, args=(ser,), daemon=True).start()
     threading.Thread(target=input_thread, daemon=True).start()
 
-    # Wait for first data
     print("  Waiting for data...", end='', flush=True)
     for _ in range(100):
         with data_lock:
@@ -278,14 +264,14 @@ def main():
         time.sleep(0.1)
     print(" OK\n")
 
-    # ── Setup figure ─────────────────────────────────────────────
+    # ── Setup figure (3 panels: profile, classification, overlay) ─
     plt.ion()
-    fig = plt.figure(figsize=(17, 10))
+    fig = plt.figure(figsize=(15, 9))
     fig.patch.set_facecolor(BG_DARK)
     gs = gridspec.GridSpec(2, 2, hspace=0.38, wspace=0.28,
                            left=0.06, right=0.96, top=0.91, bottom=0.07)
 
-    # -- Panel 1: Live range profile -----
+    # Panel 1 (top-left): Live range profile
     ax_profile = fig.add_subplot(gs[0, 0])
     style_ax(ax_profile, 'Live Range Profile')
     ax_profile.set_xlabel('Range (m)', color=TEXT_CLR, fontsize=9)
@@ -293,56 +279,41 @@ def main():
     line_live, = ax_profile.plot([], [], color=ACCENT, linewidth=1.0, alpha=0.5,
                                   label='instantaneous')
     line_avg,  = ax_profile.plot([], [], color='#ffaa00', linewidth=2.0,
-                                  label='averaged (10 frames)')
+                                  label='averaged')
     ax_profile.axvspan(NEAR_START_M, NEAR_END_M, alpha=0.08, color='#00ff88',
-                        label='analysis zone')
+                        label='ROI')
     ax_profile.legend(loc='upper right', fontsize=7, facecolor=BG_PANEL,
                       edgecolor=GRID_CLR, labelcolor='white')
 
-    # -- Panel 2: Feature time series -----
-    ax_feat = fig.add_subplot(gs[0, 1])
-    style_ax(ax_feat, 'Surface Features (Rolling)')
-    ax_feat.set_xlabel('Frame', color=TEXT_CLR, fontsize=9)
+    # Panel 2 (top-right): Classification result
+    ax_result = fig.add_subplot(gs[0, 1])
+    ax_result.set_facecolor(BG_PANEL)
+    ax_result.set_xticks([])
+    ax_result.set_yticks([])
+    for spine in ax_result.spines.values():
+        spine.set_color(GRID_CLR)
+    result_text = ax_result.text(0.5, 0.55, 'No reference\nPress \'c\' to record grass',
+                                  transform=ax_result.transAxes, ha='center', va='center',
+                                  fontsize=20, color=TEXT_CLR, fontweight='bold')
+    sim_text = ax_result.text(0.5, 0.18, '',
+                               transform=ax_result.transAxes, ha='center', va='center',
+                               fontsize=13, color=TEXT_CLR)
+    ax_result.set_title('Classification', color='white', fontsize=12,
+                         fontweight='bold', pad=10)
 
-    feat_keys    = ['mean_power', 'peak_to_mean', 'variance', 'decay_rate']
-    feat_labels  = ['Mean Power (dB)', 'Peak / Mean', 'Bin Variance', 'Decay Rate']
-    feat_colors  = ['#e74c3c', '#2ecc71', '#3498db', '#f39c12']
-    feat_history = {k: deque(maxlen=300) for k in feat_keys}
-    feat_lines   = {}
-
-    # Use twin axes so different-scaled features are readable
-    ax_feat_r = ax_feat.twinx()
-    ax_feat_r.tick_params(colors=TEXT_CLR, labelsize=8)
-    ax_feat_r.spines['right'].set_color(GRID_CLR)
-
-    for i, (key, label, color) in enumerate(zip(feat_keys, feat_labels, feat_colors)):
-        target_ax = ax_feat if i == 0 else ax_feat_r
-        ln, = target_ax.plot([], [], color=color, linewidth=1.4, label=label, alpha=0.85)
-        feat_lines[key] = (ln, target_ax)
-
-    # Combined legend
-    lines_all = [feat_lines[k][0] for k in feat_keys]
-    ax_feat.legend(lines_all, feat_labels, loc='upper left', fontsize=6,
-                   facecolor=BG_PANEL, edgecolor=GRID_CLR, labelcolor='white', ncol=2)
-
-    # -- Panel 3: Captured profiles overlay -----
-    ax_compare = fig.add_subplot(gs[1, 0])
-    style_ax(ax_compare, 'Captured Surface Profiles (press \'c\' to capture)')
+    # Panel 3 (bottom, full width): Profile overlay
+    ax_compare = fig.add_subplot(gs[1, :])
+    style_ax(ax_compare, 'Grass Reference vs Live (ROI)')
     ax_compare.set_xlabel('Range (m)', color=TEXT_CLR, fontsize=9)
     ax_compare.set_ylabel('Power (dB)', color=TEXT_CLR, fontsize=9)
 
-    # -- Panel 4: Feature bar comparison -----
-    ax_bars = fig.add_subplot(gs[1, 1])
-    style_ax(ax_bars, 'Feature Comparison')
-
-    fig.suptitle('xWRL1432 Surface Classification Dashboard',
+    fig.suptitle('xWRL1432 Grass Classifier',
                  color='white', fontsize=15, fontweight='bold', y=0.97)
     plt.show(block=False)
 
     # ── Main Loop ────────────────────────────────────────────────
-    avg_buffer = deque(maxlen=10)
+    avg_buffer = deque(maxlen=AVG_FRAMES)
     frame_idx = 0
-    capture_count = 0
 
     while not exit_event.is_set():
         with data_lock:
@@ -358,29 +329,13 @@ def main():
         avg_buffer.append(profile_db)
         avg_profile = np.mean(avg_buffer, axis=0)
 
-        features = compute_features(profile)
-        for key in feat_history:
-            feat_history[key].append(features[key])
-
-        # ── Capture ──────────────────────────────────────────────
+        # ── Capture grass reference ──────────────────────────────
         if capture_event.is_set():
             capture_event.clear()
-            capture_count += 1
-            name = input(f"  Surface name (e.g. grass, concrete): ").strip()
-            if not name:
-                name = f"surface_{capture_count}"
+            grass_ref_db = avg_profile.copy()
+            print(f"  -> Grass reference recorded ({len(avg_buffer)} frames averaged)")
 
-            avg_linear = np.mean([10 ** (p / 10) - 1 for p in avg_buffer], axis=0)
-            avg_linear = np.clip(avg_linear, 0, None)
-
-            captured_surfaces[name] = {
-                'profile_db': avg_profile.copy(),
-                'features': compute_features(avg_linear),
-            }
-            print(f"  -> Captured '{name}': {captured_surfaces[name]['features']}")
-            print(f"     ({len(captured_surfaces)} surface(s) stored)\n")
-
-        # ── Panel 1 Update ───────────────────────────────────────
+        # ── Panel 1: live profile ────────────────────────────────
         line_live.set_data(RANGE_AXIS, profile_db)
         line_avg.set_data(RANGE_AXIS, avg_profile)
         ax_profile.set_xlim(0, min(MAX_RANGE, 4.0))
@@ -388,78 +343,50 @@ def main():
         hi = np.max(avg_profile) + 10
         ax_profile.set_ylim(lo, hi)
 
-        # ── Panel 2 Update ───────────────────────────────────────
-        for key, (ln, target_ax) in feat_lines.items():
-            data = list(feat_history[key])
-            ln.set_data(range(len(data)), data)
-        x_max = max(300, frame_idx)
-        ax_feat.set_xlim(max(0, frame_idx - 300), frame_idx)
+        # ── Panel 2: classification result ───────────────────────
+        if grass_ref_db is not None:
+            is_grass, diff, shift = classify_grass(avg_profile, grass_ref_db)
 
-        # Rescale left axis (mean_power)
-        mp = list(feat_history['mean_power'])
-        if mp:
-            ax_feat.set_ylim(max(0, min(mp[-100:]) - 2), max(mp[-100:]) + 2)
+            if is_grass:
+                label = 'GRASS'
+                color = '#2ecc71'
+            else:
+                label = 'NOT GRASS'
+                color = '#e74c3c'
 
-        # Rescale right axis (other features)
-        right_vals = []
-        for k in ['peak_to_mean', 'variance', 'decay_rate']:
-            right_vals.extend(list(feat_history[k])[-100:])
-        if right_vals:
-            ax_feat_r.set_ylim(max(0, min(right_vals) - 0.5), max(right_vals) + 0.5)
+            result_text.set_text(label)
+            result_text.set_color(color)
+            result_text.set_fontsize(42)
+            shift_cm = shift * RANGE_PER_BIN * 100
+            sim_text.set_text(
+                f'L1 diff: {diff:.1f}  (threshold: {GRASS_THRESHOLD})\n'
+                f'shift: {shift:+d} bin ({shift_cm:+.1f} cm)')
+            sim_text.set_color(TEXT_CLR)
 
-        # ── Panel 3 Update (every 10 frames) ─────────────────────
-        if captured_surfaces and frame_idx % 10 == 0:
+        # ── Panel 3: overlay (every 5 frames) ───────────────────
+        if frame_idx % 5 == 0:
             ax_compare.clear()
-            style_ax(ax_compare, 'Captured Surface Profiles')
+            style_ax(ax_compare, 'Grass Reference vs Live (ROI)')
             ax_compare.set_xlabel('Range (m)', color=TEXT_CLR, fontsize=9)
             ax_compare.set_ylabel('Power (dB)', color=TEXT_CLR, fontsize=9)
 
             near_range = RANGE_AXIS[NEAR_BIN_START:NEAR_BIN_END]
+            cur_roi = avg_profile[NEAR_BIN_START:NEAR_BIN_END]
 
-            for i, (name, data) in enumerate(captured_surfaces.items()):
-                color = SURFACE_COLORS[i % len(SURFACE_COLORS)]
-                near_db = data['profile_db'][NEAR_BIN_START:NEAR_BIN_END]
-                ax_compare.plot(near_range, near_db,
-                                color=color, linewidth=2.2, label=name, alpha=0.9)
+            if grass_ref_db is not None:
+                ref_roi = grass_ref_db[NEAR_BIN_START:NEAR_BIN_END]
+                ax_compare.plot(near_range, ref_roi,
+                                color='#2ecc71', linewidth=2.2, label='grass ref', alpha=0.9)
+                ax_compare.fill_between(near_range, ref_roi, cur_roi,
+                                         alpha=0.15, color='#e74c3c', label='difference')
 
-            # Current (dashed)
-            cur_near = avg_profile[NEAR_BIN_START:NEAR_BIN_END]
-            ax_compare.plot(near_range, cur_near,
-                            color='white', linewidth=1.2, linestyle='--',
-                            label='live', alpha=0.45)
+            ax_compare.plot(near_range, cur_roi,
+                            color='white', linewidth=1.5, linestyle='--',
+                            label='live', alpha=0.7)
 
             ax_compare.set_xlim(NEAR_START_M, NEAR_END_M)
             ax_compare.legend(loc='upper right', fontsize=8, facecolor=BG_PANEL,
                               edgecolor=GRID_CLR, labelcolor='white')
-
-        # ── Panel 4 Update (every 10 frames) ─────────────────────
-        if captured_surfaces and frame_idx % 10 == 0:
-            ax_bars.clear()
-            style_ax(ax_bars, 'Feature Comparison')
-
-            n_surfaces = len(captured_surfaces)
-            n_feats = len(feat_keys)
-            bar_w = 0.75 / max(n_surfaces + 1, 2)
-            x_pos = np.arange(n_feats)
-
-            for i, (name, data) in enumerate(captured_surfaces.items()):
-                color = SURFACE_COLORS[i % len(SURFACE_COLORS)]
-                vals = [data['features'][k] for k in feat_keys]
-                ax_bars.bar(x_pos + i * bar_w, vals, bar_w,
-                            label=name, color=color, alpha=0.85,
-                            edgecolor='white', linewidth=0.4)
-
-            # Current live
-            cur_vals = [features[k] for k in feat_keys]
-            ax_bars.bar(x_pos + n_surfaces * bar_w, cur_vals, bar_w,
-                        label='live', color='white', alpha=0.3,
-                        edgecolor='white', linewidth=0.4)
-
-            short_labels = ['Mean\nPower', 'Peak /\nMean', 'Bin\nVariance', 'Decay\nRate']
-            ax_bars.set_xticks(x_pos + bar_w * n_surfaces / 2)
-            ax_bars.set_xticklabels(short_labels, fontsize=8, color=TEXT_CLR)
-            ax_bars.legend(loc='upper right', fontsize=7, facecolor=BG_PANEL,
-                           edgecolor=GRID_CLR, labelcolor='white')
 
         # ── Refresh ──────────────────────────────────────────────
         try:

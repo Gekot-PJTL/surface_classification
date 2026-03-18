@@ -48,14 +48,14 @@ MAX_RANGE        = RANGE_PER_BIN * NUM_RANGE_BINS
 RANGE_AXIS       = np.arange(NUM_RANGE_BINS) * RANGE_PER_BIN
 
 # Analysis zone
-NEAR_START_M   = 0.75
-NEAR_END_M     = 2
+NEAR_START_M   = 1
+NEAR_END_M     = 4
 NEAR_BIN_START = max(1, int(NEAR_START_M / RANGE_PER_BIN))
 NEAR_BIN_END   = min(NUM_RANGE_BINS, int(NEAR_END_M / RANGE_PER_BIN))
 
 # Classification
-GRASS_THRESHOLD     = 0.89
-HEIGHT_TOLERANCE_CM = 5.0   # max expected sensor height change — tune this
+GRASS_THRESHOLD     = 0.9
+HEIGHT_TOLERANCE_CM = 0   # max expected sensor height change — tune this
 MAX_SHIFT_BINS      = max(1, int(np.ceil((HEIGHT_TOLERANCE_CM / 100.0) / RANGE_PER_BIN)))
 AVG_FRAMES          = 10    # number of frames for moving average
 

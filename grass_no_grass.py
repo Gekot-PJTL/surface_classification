@@ -49,12 +49,12 @@ RANGE_AXIS       = np.arange(NUM_RANGE_BINS) * RANGE_PER_BIN
 
 # Analysis zone
 NEAR_START_M   = 0.75
-NEAR_END_M     = 2
+NEAR_END_M     = 3
 NEAR_BIN_START = max(1, int(NEAR_START_M / RANGE_PER_BIN))
 NEAR_BIN_END   = min(NUM_RANGE_BINS, int(NEAR_END_M / RANGE_PER_BIN))
 
 # Classification threshold (cosine similarity, 0–1)
-GRASS_THRESHOLD = 0.89
+GRASS_THRESHOLD = 0.9
 
 # ── Shared State ─────────────────────────────────────────────────
 data_lock      = threading.Lock()
